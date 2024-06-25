@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Movie Recommender</title>
+    <link href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #343a40;
+            color: #ffffff;
+        }
+        .container {
+            margin-top: 50px;
+            max-width: 600px;
+        }
+        .card {
+            padding: 20px;
+            margin-top: 20px;
+            border-radius: 10px;
+            background-color: #495057;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+        .btn-primary {
+            background-color: #007bff;
+            border: none;
+            border-radius: 50px;
+        }
+        .btn-primary:hover {
+            background-color: #0056b3;
+        }
+        .form-control {
+            border-radius: 50px;
+        }
+        h1 {
+            font-family: 'Arial', sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1 class="text-center">Movie Recommender System</h1>
+            <form action="/recommend" method="POST">
+                <div class="form-group">
+                    <label for="title">Enter Movie Title</label>
+                    <input type="text" class="form-control" id="title" name="title" placeholder="e.g. Toy Story" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="k">Number of Recommendations</label>
+                    <input type="number" class="form-control" id="k" name="k" value="10" required>
+                </div>
+                <button type="submit" class="btn btn-primary btn-block">Get Recommendations</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
