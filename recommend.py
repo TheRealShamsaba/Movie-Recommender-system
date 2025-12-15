@@ -8,8 +8,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # %%
-ratings = pd.read_csv('https://s3-us-west-2.amazonaws.com/recommender-tutorial/ratings.csv')
-movies = pd.read_csv('https://s3-us-west-2.amazonaws.com/recommender-tutorial/movies.csv')
+# Load data from local CSV files (assuming ratings.csv and movies.csv are in the project directory)
+ratings = pd.read_csv('ratings.csv', sep='\t', header=None, names=['userId', 'movieId', 'rating', 'timestamp'])
+movies = pd.read_csv('movies.csv', sep='|', encoding='latin-1', header=None)
+# Genres are columns 5 to 23
+genre_cols = movies.iloc[:, 5:24]
+genres_df = pd.read_csv('ml-100k/u.genre', sep='|', header=None, names=['genre', 'id'])
+genre_names = genres_df['genre'].tolist()
+movies['genres'] = genre_cols.apply(lambda x: '|'.join([genre_names[i] for i, val in enumerate(x) if val == 1]), axis=1)
+movies = movies.iloc[:, [0,1,24]]  # movieId, title, genres
+movies.columns = ['movieId', 'title', 'genres']
 ratings.head()
 
 # %%
@@ -345,4 +353,300 @@ print(f"Because you watched {movie_title}:")
 for i in similar_movies:
     print(movie_titles[i])
 
+# %%
+# Improvements for accuracy
 
+# Add necessary imports
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import warnings
+warnings.filterwarnings('ignore')
+
+# %%
+# Train-test split for evaluation
+ratings_train, ratings_test = train_test_split(ratings, test_size=0.2, random_state=42)
+X_train, user_mapper_train, movie_mapper_train, user_inv_mapper_train, movie_inv_mapper_train = create_X(ratings_train)
+movie_features = X_train.T.tocsr()
+
+# %%
+def compute_user_means(X, user_inv_mapper):
+    """
+    Compute average rating per user using training data only.
+    """
+    user_sums = np.array(X.sum(axis=1)).ravel()
+    user_counts = np.array(X.getnnz(axis=1)).ravel()
+    user_means = np.divide(user_sums, user_counts, out=np.zeros_like(user_sums, dtype=float), where=user_counts != 0)
+    return {user_inv_mapper[i]: user_means[i] for i in range(len(user_inv_mapper))}
+
+user_mean_map = compute_user_means(X_train, user_inv_mapper_train)
+global_mean = ratings_train['rating'].mean()
+
+# %%
+def evaluate_baseline(ratings_split, user_mean_map, global_mean):
+    """
+    Compare predictions that rely solely on user averages (or global mean as fallback).
+    """
+    predictions = []
+    actuals = []
+    for _, row in ratings_split.iterrows():
+        predictions.append(user_mean_map.get(row['userId'], global_mean))
+        actuals.append(row['rating'])
+    rmse = np.sqrt(mean_squared_error(actuals, predictions))
+    mae = mean_absolute_error(actuals, predictions)
+    return rmse, mae
+
+# %%
+def get_movie_neighbors(movie_id, movie_features, model, movie_mapper, movie_inv_mapper, k=10, metric='cosine'):
+    """
+    Retrieve k similar movies along with similarity scores from a pre-fit kNN model.
+    """
+    movie_ind = movie_mapper.get(movie_id)
+    if movie_ind is None:
+        return []
+    n_neighbors = min(k + 1, movie_features.shape[0])
+    distances, indices = model.kneighbors(movie_features[movie_ind], n_neighbors=n_neighbors, return_distance=True)
+    neighbors = []
+    for dist, idx in zip(distances[0], indices[0]):
+        neighbour_id = movie_inv_mapper[idx]
+        if neighbour_id == movie_id:
+            continue
+        if metric == 'cosine':
+            similarity = 1 - dist
+        else:
+            similarity = 1 / (1 + dist)
+        neighbors.append((neighbour_id, similarity))
+        if len(neighbors) == k:
+            break
+    return neighbors
+
+# %%
+def predict_rating_knn(user_id, movie_id, X, movie_features, model, user_mapper, movie_mapper, movie_inv_mapper, user_mean_map, global_mean, k=10, metric='cosine'):
+    """
+    Predict a user's rating for a movie using similarity-weighted item-based kNN.
+    """
+    if user_id not in user_mapper or movie_id not in movie_mapper:
+        return user_mean_map.get(user_id, global_mean)
+    
+    user_ind = user_mapper[user_id]
+    user_vector = X.getrow(user_ind).toarray().ravel()
+    neighbours = get_movie_neighbors(movie_id, movie_features, model, movie_mapper, movie_inv_mapper, k, metric)
+    
+    numerator = 0.0
+    denominator = 0.0
+    for neighbour_movie_id, similarity in neighbours:
+        neighbour_index = movie_mapper.get(neighbour_movie_id)
+        rating_value = user_vector[neighbour_index]
+        if rating_value > 0:
+            numerator += similarity * rating_value
+            denominator += abs(similarity)
+    
+    if denominator > 0:
+        return numerator / denominator
+    return user_mean_map.get(user_id, global_mean)
+
+# %%
+def evaluate_knn(X_train, ratings_test, user_mapper, movie_mapper, movie_inv_mapper, user_mean_map, global_mean, movie_features, k=10, metric='cosine'):
+    """
+    Compute RMSE and MAE on the held-out test set for specific k and metric.
+    """
+    model = NearestNeighbors(metric=metric, algorithm='brute')
+    model.fit(movie_features)
+    
+    predictions = []
+    actuals = []
+    for _, row in ratings_test.iterrows():
+        pred = predict_rating_knn(
+            row['userId'],
+            row['movieId'],
+            X_train,
+            movie_features,
+            model,
+            user_mapper,
+            movie_mapper,
+            movie_inv_mapper,
+            user_mean_map,
+            global_mean,
+            k,
+            metric
+        )
+        predictions.append(pred)
+        actuals.append(row['rating'])
+    
+    rmse = np.sqrt(mean_squared_error(actuals, predictions))
+    mae = mean_absolute_error(actuals, predictions)
+    return rmse, mae
+
+# %%
+def collect_predictions(X_train, ratings_subset, movie_features, model, user_mapper, movie_mapper, movie_inv_mapper, user_mean_map, global_mean, k, metric):
+    """
+    Return predictions and actual values for plotting/reporting.
+    """
+    predictions = []
+    actuals = []
+    for _, row in ratings_subset.iterrows():
+        pred = predict_rating_knn(
+            row['userId'],
+            row['movieId'],
+            X_train,
+            movie_features,
+            model,
+            user_mapper,
+            movie_mapper,
+            movie_inv_mapper,
+            user_mean_map,
+            global_mean,
+            k,
+            metric
+        )
+        predictions.append(pred)
+        actuals.append(row['rating'])
+    return predictions, actuals
+
+# %%
+# Hyper-parameter tuning with cross-validation
+k_values = [3, 5, 10, 20, 50, 100]
+metrics = ['cosine', 'euclidean', 'manhattan']
+
+def cross_validate_knn(ratings_subset, k_values, metrics, n_splits=5):
+    """
+    Perform K-fold cross-validation on the training split to choose k and metric.
+    """
+    cv_results = []
+    ratings_subset = ratings_subset.reset_index(drop=True)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    
+    for metric in metrics:
+        for k in k_values:
+            fold_rmses = []
+            fold_maes = []
+            for train_idx, val_idx in kf.split(ratings_subset):
+                train_fold = ratings_subset.iloc[train_idx]
+                val_fold = ratings_subset.iloc[val_idx]
+                X_fold, user_mapper_fold, movie_mapper_fold, user_inv_mapper_fold, movie_inv_mapper_fold = create_X(train_fold)
+                movie_features_fold = X_fold.T.tocsr()
+                user_mean_map_fold = compute_user_means(X_fold, user_inv_mapper_fold)
+                global_mean_fold = train_fold['rating'].mean()
+                rmse, mae = evaluate_knn(
+                    X_fold,
+                    val_fold,
+                    user_mapper_fold,
+                    movie_mapper_fold,
+                    movie_inv_mapper_fold,
+                    user_mean_map_fold,
+                    global_mean_fold,
+                    movie_features_fold,
+                    k=k,
+                    metric=metric
+                )
+                fold_rmses.append(rmse)
+                fold_maes.append(mae)
+            cv_results.append({
+                'metric': metric,
+                'k': k,
+                'rmse_mean': np.mean(fold_rmses),
+                'rmse_std': np.std(fold_rmses),
+                'mae_mean': np.mean(fold_maes),
+                'mae_std': np.std(fold_maes)
+            })
+            print(f"[CV] Metric={metric}, K={k} -> RMSE: {np.mean(fold_rmses):.4f}±{np.std(fold_rmses):.4f}, MAE: {np.mean(fold_maes):.4f}±{np.std(fold_maes):.4f}")
+    return pd.DataFrame(cv_results)
+
+# %%
+def run_accuracy_pipeline():
+    """
+    Execute the full accuracy workflow (baseline, CV, final eval, plots) and return artifacts.
+    """
+    baseline_rmse, baseline_mae = evaluate_baseline(ratings_test, user_mean_map, global_mean)
+    print(f"Baseline (user mean) -> RMSE: {baseline_rmse:.4f}, MAE: {baseline_mae:.4f}")
+
+    cv_results_df = cross_validate_knn(ratings_train, k_values, metrics)
+    cv_results_df = cv_results_df.sort_values('rmse_mean').reset_index(drop=True)
+    cv_results_df.to_csv("knn_cv_results.csv", index=False)
+    print("\nTop CV configurations:")
+    print(cv_results_df.head())
+    print("Saved all CV results to knn_cv_results.csv for reporting.")
+
+    best_params = cv_results_df.iloc[0][['k', 'metric']].to_dict()
+    best_k = int(best_params['k'])
+    best_metric = best_params['metric']
+    best_model = NearestNeighbors(metric=best_metric, algorithm='brute')
+    best_model.fit(movie_features)
+
+    final_rmse, final_mae = evaluate_knn(
+        X_train,
+        ratings_test,
+        user_mapper_train,
+        movie_mapper_train,
+        movie_inv_mapper_train,
+        user_mean_map,
+        global_mean,
+        movie_features,
+        k=best_k,
+        metric=best_metric
+    )
+    print(f"\nFinal evaluation -> RMSE: {final_rmse:.4f}, MAE: {final_mae:.4f}")
+    print(f"Improvement vs baseline -> ΔRMSE: {baseline_rmse - final_rmse:.4f}, ΔMAE: {baseline_mae - final_mae:.4f}")
+
+    summary_df = pd.DataFrame(
+        [
+            {"model": "Baseline (user mean)", "rmse": baseline_rmse, "mae": baseline_mae},
+            {"model": f"KNN tuned (k={best_k}, metric={best_metric})", "rmse": final_rmse, "mae": final_mae},
+            {"model": "Improvement (baseline - tuned)", "rmse": baseline_rmse - final_rmse, "mae": baseline_mae - final_mae},
+        ]
+    )
+    summary_df.to_csv("benchmark_summary.csv", index=False)
+    print("Saved benchmark metrics to benchmark_summary.csv.")
+
+    preds, actuals = collect_predictions(
+        X_train,
+        ratings_test,
+        movie_features,
+        best_model,
+        user_mapper_train,
+        movie_mapper_train,
+        movie_inv_mapper_train,
+        user_mean_map,
+        global_mean,
+        best_k,
+        best_metric
+    )
+
+    # Visual diagnostics: scatter highlights discrete ratings, histogram shows error spread.
+    plt.figure(figsize=(14,5))
+    plt.subplot(1,2,1)
+    plt.scatter(actuals, preds, alpha=0.3)
+    plt.xlabel("Actual Ratings")
+    plt.ylabel("Predicted Ratings")
+    plt.title("Predicted vs Actual Ratings")
+
+    plt.subplot(1,2,2)
+    errors = np.array(actuals) - np.array(preds)
+    sns.histplot(errors, bins=30, kde=True)
+    plt.xlabel("Prediction Error (Actual - Predicted)")
+    plt.title("Error Distribution")
+    plt.tight_layout()
+    plt.savefig("accuracy_diagnostics.png", dpi=300)
+    plt.show()
+    print("Saved accuracy plots to accuracy_diagnostics.png.")
+
+    return {
+        'best_model': best_model,
+        'best_k': best_k,
+        'best_metric': best_metric,
+        'cv_results': cv_results_df,
+        'baseline_metrics': {'rmse': baseline_rmse, 'mae': baseline_mae},
+        'final_metrics': {'rmse': final_rmse, 'mae': final_mae}
+    }
+
+results = run_accuracy_pipeline()
+best_model = results['best_model']
+best_k = results['best_k']
+best_metric = results['best_metric']
+
+movie_id = 1
+similar_movies = get_movie_neighbors(movie_id, movie_features, best_model, movie_mapper_train, movie_inv_mapper_train, k=best_k, metric=best_metric)
+movie_title = movie_titles[movie_id]
+
+print(f"Because you watched {movie_title} (with tuned params):")
+for movie_idx, _ in similar_movies:
+    print(movie_titles[movie_idx])

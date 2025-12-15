@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# OS / IDE noise
+.DS_Store
+.idea/
+.vscode/
+
+# Build / packaging
+*.egg-info/
+dist/
+build/
+
+# Project artifacts
+knn_cv_results.csv
